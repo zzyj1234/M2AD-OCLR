@@ -1,17 +1,18 @@
 OCLR
 Copyright 2026 OCLR contributors
 
-This product provides an architecture-only reference for a method developed
-from the Dinomaly reconstruction architecture:
+This product provides an executable architecture reference for a method
+developed from the Dinomaly reconstruction architecture:
 
   Dinomaly: The Less Is More Philosophy in Multi-Class Unsupervised
   Anomaly Detection, CVPR 2025.
   https://github.com/guojiajeremy/Dinomaly
 
 Dinomaly is licensed under the Apache License, Version 2.0. The public OCLR
-files describe route conditioning, local-only Q/V LoRA, and the shared
-FP16-safe decoder block family. The end-to-end experiment pipeline is not
-included.
+files implement feature-level Global/Local routes, route conditioning,
+local-only Q/V LoRA, feature fusion, and the shared FP16-safe decoder block
+family. The image, training, inference-aggregation, evaluation, and checkpoint
+pipeline is not included.
 
 The DINOv2 runtime dependency is developed by Meta Platforms, Inc. and
 contributors and is licensed under the Apache License, Version 2.0.

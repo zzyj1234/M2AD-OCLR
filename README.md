@@ -1,103 +1,145 @@
 # OCLR
 
-Architecture-only reference for **Overlap-consistent Local Reconstruction
-(OCLR)**, a method for high-resolution industrial anomaly localization.
+Executable architecture reference for **Overlap-consistent Local
+Reconstruction (OCLR)** for high-resolution industrial anomaly localization.
 
-> **Release scope:** this repository is intended to communicate the model
-> architecture and component relationships. It is not an official
-> reproducibility package.
+This release sits between a static diagram and a full reproduction package:
 
-## What is public
+- both Global and Local post-encoder routes execute end to end;
+- both routes provably reuse the same reconstruction decoder;
+- route conditioning, Local-only Q/V LoRA, feature fusion, and FP16-safe
+  linear attention are implemented and tested;
+- paper-scale parameter counts are audited automatically;
+- data processing, training objectives, overlap-target construction, anomaly
+  aggregation, evaluation, checkpoints, and weights are not released.
 
-- the global/local route structure;
-- the route-specific conditioner;
-- the shared linear-attention reconstruction decoder;
-- the local-only Q/V LoRA module;
-- the target-layer and fusion-group specification reported in the manuscript;
-- reported benchmark results and dataset information.
-
-## What is intentionally not public
-
-- the end-to-end forward and backward execution path;
-- training objectives and overlap-target construction;
-- data preprocessing and sampling code;
-- source-space inference aggregation;
-- checkpoint loading or conversion code;
-- experiment configurations, commands, and pretrained checkpoints;
-- the original multi-method development framework.
-
-The omitted components are represented explicitly by an exception in
-OCLRArchitecture.forward. This makes the release scope unambiguous: the code
-can be inspected as an architecture reference, but it cannot be used as a
-drop-in training or inference package.
+The code validates the manuscript architecture, but it cannot reproduce the
+reported benchmark results by itself.
 
 ## Architecture
 
-    Input
-      |
-      +-- Global route (training only)
-      |     |
-      |     +-- Frozen DINOv2-reg encoder
-      |     +-- Global route conditioner
-      |     -- Shared reconstruction decoder
-      |
-      -- Overlapping local routes (training and inference)
-            |
-            +-- Frozen teacher features
-            +-- Local-only Q/V LoRA features
-            +-- Local route conditioner
-            -- Shared reconstruction decoder
+    Global view -> frozen encoder -> Global conditioner --+
+                                                         |
+                                              shared bottleneck
+                                                         |
+                                              shared 8-block decoder
+                                                         |
+    Local view  -> teacher target ----------------------> reconstruction
+              -> Local Q/V LoRA -> Local conditioner --+
+                                                         |
+                                  omitted overlap agreement and map aggregation
 
-During training, the global and local routes regularize the same decoder, and
-overlapping local predictions are encouraged to agree. At inference, the
-global route is removed and only overlapping local reconstruction is used.
+The public boundary begins at eight target-layer token tensors from an
+external frozen encoder. Each feature has shape B x N x C, including
+class/register tokens.
 
-The public component graph is implemented in
-src/oclr/architecture.py:
+| Manuscript component | Public implementation |
+|---|---|
+| Target blocks 2--9 | ArchitectureSpec.target_layers |
+| Two groups of four encoder features | encoder_fusion |
+| Global/Local route conditioning | BranchConditioner |
+| Local-only Q/V adaptation | LocalOnlyQVLora |
+| Shared reconstruction bottleneck | BottleneckMLP |
+| Shared eight-block decoder | LinearAttentionDecoderBlock |
+| Global feature route | OCLRArchitecture.forward_global |
+| Local teacher/adapted route | OCLRArchitecture.forward_local |
 
-- ArchitectureSpec records the model-level design.
-- BranchConditioner implements independent route normalization and embeddings.
-- LocalOnlyQVLora shows how the local route adapts Q and V while leaving K and
-  the global route unchanged.
-- LinearAttentionDecoderBlock shows the shared decoder block family and
-  FP32 accumulation used for reduced-precision safety.
-- OCLRArchitecture assembles the inspectable public modules but intentionally
-  has no end-to-end forward.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the tensor contract and
+[docs/RELEASE_SCOPE.md](docs/RELEASE_SCOPE.md) for the release boundary.
 
-## Installation and inspection
+## Installation
 
 Python 3.9+ and PyTorch 2.1+ are required.
 
+    git clone https://github.com/zzyj1234/M2AD-OCLR.git
+    cd M2AD-OCLR
     pip install -e .
 
-Inspect the architecture:
+## Executable smoke test
 
-    from oclr import OCLRArchitecture
+The CPU-friendly example uses a reduced dimension while preserving the public
+execution graph:
 
-    architecture = OCLRArchitecture()
-    print(architecture)
-    print(architecture.describe())
+    python examples/smoke_test.py
 
-Calling architecture(...) raises a RuntimeError by design.
+Equivalent API usage:
 
-Run the architecture-level tests:
+    import torch
+    from oclr import ArchitectureSpec, OCLRArchitecture
+
+    spec = ArchitectureSpec(
+        target_layers=(0, 1, 2, 3),
+        encoder_fusion=((0, 1), (2, 3)),
+        decoder_fusion=((0, 1), (2, 3)),
+        decoder_depth=4,
+        decoder_heads=4,
+        embedding_dim=32,
+        local_lora_blocks=(1, 2),
+        lora_rank=2,
+    )
+    model = OCLRArchitecture(spec).eval()
+    teacher = [torch.randn(1, 18, 32) for _ in spec.target_layers]
+    adapted = [feature + 0.01 * torch.randn_like(feature) for feature in teacher]
+
+    global_output = model.forward_global(teacher)
+    local_output = model.forward_local(teacher, adapted)
+    print(global_output.decoder_tokens.shape)  # torch.Size([1, 18, 32])
+    print(local_output.decoder_tokens.shape)   # torch.Size([1, 18, 32])
+
+No DINOv2 download, dataset, or checkpoint is needed for the smoke test.
+
+## Parameter audit
+
+Run:
+
+    python examples/audit_paper_architecture.py
+
+Expected paper-scale audit:
+
+| Component | Parameters |
+|---|---:|
+| Route conditioner | 4,608 |
+| Reconstruction bottleneck | 4,722,432 |
+| Shared decoder | 56,702,976 |
+| Local Q/V LoRA | 49,152 |
+| Total trainable architecture | **61,479,168** |
+| OCLR additions over the shared baseline | **53,760** |
+
+The final two values agree with the manuscript's 61.479M trainable parameters
+and 53,760 added parameters.
+
+## Verification
 
     pip install -e ".[test]"
     pytest -q
 
+Tests verify executable routes, shapes, shared decoder reuse, independent
+conditioners, Local Q/V-only changes, frozen base projections, finite
+attention outputs/gradients, exact parameter counts, and invalid inputs.
+
+## Deliberately omitted
+
+- raw-image preprocessing and crop sampling;
+- DINOv2 loading/execution and in-place adapter injection;
+- reconstruction and overlap-consistency objectives;
+- training loop, optimizer, scheduler, and exact configuration;
+- source-space anomaly-map generation and overlap aggregation;
+- object/view grouping and AUROC/AP/mF1/AUPRO evaluation;
+- checkpoint I/O, pretrained weights, and experiment outputs.
+
+This repository is an **executable architecture reference**, not complete
+source code or a reproducibility package.
+
 ## Plastic Gear data
 
-The dataset bundle shared separately from this repository is:
-
 - Archive: M2AD_Gear.rar
-- Baidu Netdisk: https://pan.baidu.com/s/17cXv5vDcnG01WtFPnC4YIQ?pwd=aila
+- Baidu Netdisk:
+  https://pan.baidu.com/s/17cXv5vDcnG01WtFPnC4YIQ?pwd=aila
 - Extraction code: aila
 
-The archive is not part of the software distribution. Users must comply with
-the terms applying to the source images and dataset. This architecture-only
-repository does not include a loader or training recipe for the archive.
-
-Dataset facts reported in the manuscript:
+The archive is not included here. Users must comply with the terms applying
+to the source images and dataset. This release has no loader or training
+recipe for the archive.
 
 | Dataset | Train normal | Test normal | Test anomalous | Categories |
 |---|---:|---:|---:|---:|
@@ -108,14 +150,13 @@ Dataset facts reported in the manuscript:
 M2AD-Synergy counts are from an audit of 119,759 decodable records. Plastic
 Gear uses 37 repaired normal sources for training and five for normal testing;
 horizontal flip and 180-degree rotation yield 111 and 15 normal images. Its
-anomalous test set contains 59 distinct 896x896 images with pixel masks and
-five defect labels: damage, dark spot, dirt, flash, and hair.
+anomalous test set contains 59 distinct 896x896 images with masks and five
+labels: damage, dark spot, dirt, flash, and hair.
 
 ## Reported results
 
-The numbers below are percentages transcribed from the manuscript. They are
-final-epoch, single-seed results and are not reproduced by this
-architecture-only repository.
+These percentages are transcribed from the manuscript. They are final-epoch,
+single-seed results and are not reproduced by this architecture release.
 
 | Dataset / method | Object AUROC | View AUROC | Pixel AUROC | Pixel mF1 | Pixel AP | AUPRO |
 |---|---:|---:|---:|---:|---:|---:|
@@ -128,24 +169,18 @@ architecture-only repository.
 
 On the reported system, OCLR has 148.063M total parameters, 61.479M trainable
 parameters, a 234.564 MiB compact checkpoint, 3.797 GiB peak training memory,
-and 16.223 FPS. Plastic Gear is an exploratory benchmark and should not be
-interpreted as production validation.
+and 16.223 FPS. Plastic Gear is exploratory and is not production validation.
 
-## Manuscript status and citation
+## Manuscript status
 
 The manuscript is currently **in preparation**. It has not yet been submitted,
-so this repository does not describe it as "under submission" and does not
-provide a provisional paper citation with invented author or venue metadata.
+so this repository does not call it "under submission" or assign a
+provisional journal citation.
 
-A complete BibTeX record will be added when the manuscript is publicly
-available or bibliographic information has been assigned. Until then, cite
-this repository only if a repository URL, author list, release version, and
-release date have been added by the maintainers.
-
-Because the intended journal uses double-anonymized review, maintainers should
-consider keeping this repository private during review or providing reviewers
-with a genuinely anonymized snapshot that contains no account, commit, author,
-affiliation, acknowledgement, or funding identifiers.
+The intended journal uses double-anonymized review. Keep this identity-bearing
+repository private during review or give reviewers a genuinely anonymized
+snapshot with no account, commit-author, affiliation, acknowledgement, or
+funding identifiers.
 
 ## Acknowledgements
 
@@ -155,14 +190,12 @@ based on [DINOv2](https://github.com/facebookresearch/dinov2). Dataset
 protocols build on [M2AD](https://github.com/hustCYQ/M2AD) and
 [Real-IAD](https://realiad4ad.github.io/Real-IAD/).
 
-No Dinomaly, DINOv2, M2AD, ADer, dataset, pretrained weight, checkpoint, or
-experiment artifact is included here. See [THIRD_PARTY.md](THIRD_PARTY.md)
-and [NOTICE](NOTICE).
+No third-party source tree, dataset, pretrained weight, checkpoint, or
+experiment artifact is included. See [THIRD_PARTY.md](THIRD_PARTY.md) and
+[NOTICE](NOTICE).
 
 ## License
 
-The architecture reference is released under the
-[Apache License 2.0](LICENSE). Apache-2.0 permits use, modification, and
-redistribution of the published files. The release is harder to reproduce
-because implementation components are omitted, not because the license
-prohibits legitimate reuse.
+The published architecture reference is under the
+[Apache License 2.0](LICENSE). Third-party projects and datasets retain their
+own licenses and terms.
